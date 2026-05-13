@@ -32,6 +32,7 @@ from tqdm import tqdm as _tqdm
 from ._core import InitializableFromConfig as _InitializableFromConfig
 from ._core import WithTeardown as _WithTeardown
 from ._handshake import HandshakeError as _HandshakeError
+from .hooks import ExportModelDictPostHook as _ExportModelDictPostHook
 from .util import init as _init
 
 logger = _logging.getLogger(__name__)
@@ -334,7 +335,7 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
     Take a pair of matched audio files and serve input + output pairs.
     """
 
-    class _ScaleOutputHook:
+    class _ScaleOutputHook(_ExportModelDictPostHook):
         """
         A hook for model export to rescale the output to undo data scaling for training.
         """
@@ -342,7 +343,7 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
         def __init__(self, scale: float):
             self._scale = scale
 
-        def __call__(self, model_dict: dict):
+        def apply(self, model_dict: dict):
             strategy = {
                 "WaveNet": self._apply_wavenet,
                 "SlimmableContainer": self._apply_slimmable_container,
@@ -362,7 +363,7 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
 
         def _apply_slimmable_container(self, model_dict: dict):
             for submodel_config in model_dict["config"]["submodels"]:
-                self(submodel_config["model"])
+                self.apply(submodel_config["model"])
 
     def __init__(
         self,
@@ -967,13 +968,6 @@ def init_dataset(config, split: Split) -> AbstractDataset:
 
 
 class JointDatasetHook(_abc.ABC):
-    def __call__(
-        self, dataset_train: AbstractDataset, dataset_validation: AbstractDataset
-    ):
-        return self.apply(
-            dataset_train=dataset_train, dataset_validation=dataset_validation
-        )
-
     @_abc.abstractmethod
     def apply(
         self, dataset_train: AbstractDataset, dataset_validation: AbstractDataset
@@ -1014,7 +1008,7 @@ def apply_joint_dataset_hooks(
     hooks: _Sequence[JointDatasetHook],
 ):
     for hook in hooks:
-        hook(dataset_train=dataset_train, dataset_validation=dataset_validation)
+        hook.apply(dataset_train=dataset_train, dataset_validation=dataset_validation)
 
 
 class NormalizeJointDatasetOutput(JointDatasetHook):
