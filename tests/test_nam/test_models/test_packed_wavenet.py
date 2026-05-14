@@ -232,6 +232,10 @@ def test_packed_export_applies_model_dict_post_hooks(tmp_path):
         _pytest.approx(0.5),
         _pytest.approx(0.5),
     ]
+    assert [model["weights"][-1] for model in submodels] == [
+        _pytest.approx(0.5),
+        _pytest.approx(0.5),
+    ]
 
 
 def test_packed_export_loads_lightning_checkpoint(tmp_path):

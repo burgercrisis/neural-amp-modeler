@@ -115,12 +115,14 @@ class TestDataset(object):
         model_dict = {
             "architecture": "WaveNet",
             "config": {"head_scale": 0.5},
+            "weights": [0.125],
         }
 
         assert len(model.export_model_dict_post_hooks) == 1
         assert model._apply_export_model_dict_post_hooks(model_dict) == {
             "architecture": "WaveNet",
             "config": {"head_scale": pytest.approx(0.5 / 8.0)},
+            "weights": [pytest.approx(0.125 / 8.0)],
         }
 
     @pytest.mark.parametrize("sample_rate", _SAMPLE_RATES)

@@ -956,6 +956,16 @@ def _get_dataloaders(
     return train_dataloader, val_dataloader
 
 
+def _handshake_dataloaders(
+    model: _LightningModule, train_dataloader: _DataLoader, val_dataloader: _DataLoader
+) -> None:
+    for dataloader in (train_dataloader, val_dataloader):
+        dataset = dataloader.dataset
+        assert isinstance(dataset, _AbstractDataset)
+        dataset.handshake(model.net)
+        model.net.handshake(dataset)
+
+
 def _esr(pred: _torch.Tensor, target: _torch.Tensor) -> float:
     return (
         _torch.mean(_torch.square(pred - target)).item()
@@ -1415,6 +1425,7 @@ def train(
         )
     sample_rate = train_dataloader.dataset.sample_rate
     model.net.sample_rate = sample_rate
+    _handshake_dataloaders(model, train_dataloader, val_dataloader)
 
     # Put together the metadata that's needed in checkpoints:
     settings_metadata = _metadata.Settings(ignore_checks=ignore_checks)
@@ -1456,6 +1467,7 @@ def train(
         model.cpu()
         model.eval()
         model.net.sample_rate = sample_rate  # Hack, part 2
+        _handshake_dataloaders(model, train_dataloader, val_dataloader)
         if is_packed and packed_best_callback is not None:
             _apply_packed_best_checkpoints(
                 model, model_config, packed_best_callback.checkpoint_paths

@@ -360,6 +360,7 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
 
         def _apply_wavenet(self, model_dict: dict):
             model_dict["config"]["head_scale"] *= self._scale
+            model_dict["weights"][-1] *= self._scale
 
         def _apply_slimmable_container(self, model_dict: dict):
             for submodel_config in model_dict["config"]["submodels"]:

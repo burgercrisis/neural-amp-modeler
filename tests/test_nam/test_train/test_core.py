@@ -428,6 +428,7 @@ def test_end_to_end():
         )
         # Assertions...
         assert isinstance(train_output.model, PackedLightningModule)
+        assert train_output.model.net.export_model_dict_post_hooks
 
 
 def test_get_callbacks():
