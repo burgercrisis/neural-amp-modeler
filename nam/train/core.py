@@ -949,6 +949,14 @@ def _get_dataloaders(
         dataset_validation=dataset_validation,
         hooks=_get_joint_dataset_hooks(data_config.get("joint", [])),
     )
+    model.net.sample_rate = dataset_train.sample_rate
+
+    # Perform handshakes:
+    dataset_train.handshake(model.net)
+    dataset_validation.handshake(model.net)
+    model.net.handshake(dataset_train)
+    model.net.handshake(dataset_validation)
+
     train_dataloader = _DataLoader(dataset_train, **learning_config["train_dataloader"])
     val_dataloader = _DataLoader(
         dataset_validation, **learning_config["val_dataloader"]
@@ -959,10 +967,14 @@ def _get_dataloaders(
 def _handshake_dataloaders(
     model: _LightningModule, train_dataloader: _DataLoader, val_dataloader: _DataLoader
 ) -> None:
+    datasets = []
     for dataloader in (train_dataloader, val_dataloader):
         dataset = dataloader.dataset
         assert isinstance(dataset, _AbstractDataset)
+        datasets.append(dataset)
+    for dataset in datasets:
         dataset.handshake(model.net)
+    for dataset in datasets:
         model.net.handshake(dataset)
 
 
@@ -1425,7 +1437,6 @@ def train(
         )
     sample_rate = train_dataloader.dataset.sample_rate
     model.net.sample_rate = sample_rate
-    _handshake_dataloaders(model, train_dataloader, val_dataloader)
 
     # Put together the metadata that's needed in checkpoints:
     settings_metadata = _metadata.Settings(ignore_checks=ignore_checks)
