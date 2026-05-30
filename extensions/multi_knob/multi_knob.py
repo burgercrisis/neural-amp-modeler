@@ -14,8 +14,6 @@ from nam.models._abc import ImportsWeights
 from nam.models.factory import register as register_model
 from nam.models.metadata import UserMetadata as _UserMetadata
 from nam.models.wavenet._wavenet import WaveNet as _WaveNet
-from nam.models.wavenet._head import Head
-from nam.models.wavenet._layer_array import LayerArray
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -257,8 +255,8 @@ class MultiKnobModel(BaseNet, ImportsWeights):
             conditioning_dsp = KnobConditioningWaveNet(self._knob_names, 8)
 
             # Build the internal WaveNet's layer arrays directly
-            from nam.models.wavenet._layer_array import LayerArray
             from nam.models.wavenet._head import Head
+            from nam.models.wavenet._layer_array import LayerArray
 
             layer_configs = [{
                 "input_size": 1,
