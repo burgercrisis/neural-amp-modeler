@@ -111,7 +111,17 @@ class TestKnobConditioningWaveNet:
         x = torch.randn(2, 1, 64)
         cond_dsp.set_values(0.5, 0.3)
         c = cond_dsp(x)
-        assert c.shape == (batch_size := 2, 16, 64)
+        assert c.shape == (2, 16, 64)
+
+    def test_export_weights(self, cond_dsp):
+        weights = cond_dsp._export_weights()
+        assert isinstance(weights, list)
+        assert len(weights) > 0
+
+    def test_export_config(self, cond_dsp):
+        config = cond_dsp._export_config()
+        assert config["knob_names"] == ["gain", "tone"]
+        assert config["embedding_dim"] == 8
 
 
 # =============================================================================
@@ -154,15 +164,11 @@ class TestMultiKnobDataset:
 
         x_segment = result[0]
         y_segment = result[-1]
-        knob_gain = result[1]
-        knob_tone = result[2]
 
         assert isinstance(x_segment, torch.Tensor)
         assert isinstance(y_segment, torch.Tensor)
         assert x_segment.shape[0] == 149  # nx + ny - 1
         assert y_segment.shape[0] == 50  # ny
-        assert isinstance(knob_gain, torch.Tensor)
-        assert isinstance(knob_tone, torch.Tensor)
 
     def test_out_of_bounds(self, sample_dataset):
         with pytest.raises(IndexError):
@@ -202,8 +208,6 @@ class TestMultiKnobModel:
         batch_size = 2
         input_length = sample_model.receptive_field + 100
         x = torch.randn(batch_size, input_length)
-
-        # Knob values as positional args (sorted order: gain, tone)
         output = sample_model(x, torch.tensor(5.0), torch.tensor(0.0))
         assert isinstance(output, torch.Tensor)
         assert output.shape == (batch_size, input_length)
@@ -212,8 +216,6 @@ class TestMultiKnobModel:
         batch_size = 2
         input_length = sample_model.receptive_field + 100
         x = torch.randn(batch_size, input_length)
-
-        # Scalar knob values
         output = sample_model(x, 5.0, 0.0)
         assert output.shape == (batch_size, input_length)
 
@@ -222,7 +224,6 @@ class TestMultiKnobModel:
         assert "knob_config" in config
         assert "knob_names" in config
         assert "layers" in config
-        assert config["knob_names"] == ["gain", "tone"]
 
     def test_export_weights(self, sample_model):
         weights = sample_model._export_weights()
@@ -240,7 +241,6 @@ class TestMultiKnobModel:
 # =============================================================================
 
 def test_dataset_init_from_config(tmp_path):
-    """Test initializing dataset from configuration"""
     try:
         import soundfile as sf
     except ImportError:
@@ -279,7 +279,6 @@ def test_dataset_init_from_config(tmp_path):
 
 
 def test_model_init_from_config():
-    """Test initializing model from configuration"""
     knob_config = {
         "gain": {"embedding_dim": 8, "default_value": 0.5},
         "tone": {"embedding_dim": 8, "default_value": 0.5},

@@ -14,6 +14,8 @@ from nam.models._abc import ImportsWeights
 from nam.models.factory import register as register_model
 from nam.models.metadata import UserMetadata as _UserMetadata
 from nam.models.wavenet._wavenet import WaveNet as _WaveNet
+from nam.models.wavenet._head import Head
+from nam.models.wavenet._layer_array import LayerArray
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -41,19 +43,14 @@ class MultiKnobUserMetadata(_UserMetadata):
 # Knob Conditioning WaveNet (acts as condition_dsp)
 # =============================================================================
 
-class KnobConditioningWaveNet(_WaveNet):
+class KnobConditioningWaveNet(nn.Module, ImportsWeights):
     """
-    A WaveNet subclass that produces conditioning from knob values
-    instead of processing audio through its layers.
-
-    Used as the condition_dsp parameter in WaveNet to provide FiLM conditioning
-    based on external knob parameters.
+    Produces conditioning signal from knob values for WaveNet's FiLM mechanism.
+    Has the same interface as WaveNet for receptive_field but no internal layers.
     """
 
     def __init__(self, knob_names: list, embedding_dim: int):
-        # Initialize as a minimal WaveNet with no layers - we only use it for
-        # the conditioning interface
-        nn.Module.__init__(self)
+        super().__init__()
         self._knob_names = knob_names
         self._condition_size = len(knob_names) * embedding_dim
         self._stored_values = None
@@ -106,6 +103,24 @@ class KnobConditioningWaveNet(_WaveNet):
             embedded.append(e)
 
         return torch.cat(embedded, dim=1)
+
+    def import_weights(self, weights):
+        raise NotImplementedError
+
+    def _export_weights(self) -> list:
+        weights = []
+        for name in self._knob_names:
+            emb = self.knob_embeddings[name]
+            weights.extend(emb.weight.data.cpu().numpy().flatten())
+            if emb.bias is not None:
+                weights.extend(emb.bias.data.cpu().numpy().flatten())
+        return weights
+
+    def _export_config(self):
+        return {
+            "knob_names": self._knob_names,
+            "embedding_dim": list(self.knob_embeddings.values())[0].out_features,
+        }
 
 
 # =============================================================================
@@ -238,29 +253,44 @@ class MultiKnobModel(BaseNet, ImportsWeights):
             channels = 32
             head_size = channels // 2
 
-            # Build internal WaveNet with knob conditioning DSP
-            self._wavenet = _WaveNet.init_from_config({
-                "layers_configs": [{
-                    "input_size": 1,
-                    "condition_size": total_embedding_dim,
-                    "channels": channels,
-                    "head_size": head_size,
-                    "kernel_size": 3,
-                    "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
-                    "activation": "Tanh",
-                    "gated": True,
-                    "head_bias": True,
-                }],
-                "head_config": {
-                    "in_channels": head_size,
-                    "channels": head_size,
-                    "activation": "Tanh",
-                    "num_layers": 2,
-                    "out_channels": 1,
-                },
-                "head_scale": 0.02,
-                "condition_dsp": KnobConditioningWaveNet(self._knob_names, 8),
-            })
+            # Create the conditioning DSP module
+            conditioning_dsp = KnobConditioningWaveNet(self._knob_names, 8)
+
+            # Build the internal WaveNet's layer arrays directly
+            from nam.models.wavenet._layer_array import LayerArray
+            from nam.models.wavenet._head import Head
+
+            layer_configs = [{
+                "input_size": 1,
+                "condition_size": total_embedding_dim,
+                "channels": channels,
+                "head_size": head_size,
+                "kernel_size": 3,
+                "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+                "activation": "Tanh",
+                "gated": True,
+                "head_bias": True,
+                "is_first": True,
+                "is_last": True,
+            }]
+            layer_arrays = nn.ModuleList([
+                LayerArray.init_from_config(lc) for lc in layer_configs
+            ])
+
+            head = Head(
+                in_channels=head_size,
+                channels=head_size,
+                activation="Tanh",
+                num_layers=2,
+                out_channels=1,
+            )
+
+            self._wavenet = _WaveNet(
+                layer_arrays=layer_arrays,
+                head=head,
+                head_scale=0.02,
+                condition_dsp=conditioning_dsp,
+            )
         elif isinstance(base_model, BaseNet):
             self._wavenet = base_model._net if hasattr(base_model, '_net') else base_model
         else:
