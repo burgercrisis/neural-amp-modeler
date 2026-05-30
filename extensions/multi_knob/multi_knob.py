@@ -1,16 +1,3 @@
-import sys
-import os
-
-sys.stderr.write("\nPYTHON PATH:\n")
-for path in sys.path:
-    sys.stderr.write(f"{path}\n")
-sys.stderr.write("\n")
-
-module_path = os.path.abspath(__file__)
-sys.stderr.write(f"MULTI-KNOB MODULE STARTING FROM: {module_path}\n")
-sys.stderr.write(f"CURRENT WORKING DIR: {os.getcwd()}\n")
-sys.stderr.flush()
-
 """
 Multi-knob extension for Neural Amp Modeler
 Enables training models with multiple knob parameters
@@ -23,13 +10,10 @@ import numpy as np
 from nam.data import AbstractDataset, register_dataset_initializer, wav_to_tensor
 from nam.models.base import BaseNet
 from nam.models._abc import ImportsWeights
+from nam.models.factory import register as register_model
 from nam.models.metadata import UserMetadata
 from nam.models.wavenet import WaveNet
-from nam.train.lightning_module import LightningModule
 from pydantic import BaseModel
-
-print("\nMULTI-KNOB MODULE LOADED", flush=True)
-print("="*50, flush=True)
 
 # Metadata Extensions
 class KnobMetadata(BaseModel):
@@ -46,72 +30,7 @@ class MultiKnobUserMetadata(UserMetadata):
     knobs: Dict[str, KnobMetadata]
 
 
-@register_dataset_initializer("multi_knob")
-def init_multi_knob_dataset(
-    x_path: str,
-    y_path: str,
-    knob_settings: Dict[str, float],
-    nx: int,
-    ny: Optional[int] = None,
-    delay: Optional[int] = 0,
-    **kwargs,
-) -> "MultiKnobDataset":
-    """Initialize a multi-knob dataset from files.
-    This is where we handle delay compensation - only once per file load.
-    Delay compensation is done by padding the shorter signal with zeros.
-    """
-    print("="*50, flush=True)
-    print("INITIALIZING DATASET", flush=True)
-    print(f"x_path: {x_path}", flush=True)
-    print(f"y_path: {y_path}", flush=True)
-    print("="*50, flush=True)
-    
-    # Load audio files
-    print("\nLoading input file...", flush=True)
-    x = torch.from_numpy(np.load(x_path) if x_path.endswith('.npy') else wav_to_tensor(x_path))
-    print("Loading output file...", flush=True)
-    y = torch.from_numpy(np.load(y_path) if y_path.endswith('.npy') else wav_to_tensor(y_path))
-    
-    print(f"\nFile lengths:", flush=True)
-    print(f"Input:  {len(x)} samples", flush=True)
-    print(f"Output: {len(y)} samples", flush=True)
-    print(f"Difference: {len(x) - len(y)} samples", flush=True)
-    print(f"Delay: {delay} samples", flush=True)
-    
-    # Apply delay compensation once here
-    if delay:
-        print(f"\nApplying delay compensation of {delay} samples", flush=True)
-        if delay > 0:
-            print(f"Input longer than output by {delay} samples", flush=True)
-            print(f"  Before compensation - Input: {len(x)}, Output: {len(y)}", flush=True)
-            # Input is longer than output by 'delay' samples
-            # Add zeros to the beginning of output to align with input
-            y = torch.cat([torch.zeros(delay), y])
-            print(f"  After compensation  - Input: {len(x)}, Output: {len(y)}", flush=True)
-        else:
-            print(f"Output longer than input by {-delay} samples", flush=True)
-            print(f"  Before compensation - Input: {len(x)}, Output: {len(y)}", flush=True)
-            # Output is longer than input by 'delay' samples
-            # Add zeros to the beginning of input to align with output
-            x = torch.cat([torch.zeros(-delay), x])
-            print(f"  After compensation  - Input: {len(x)}, Output: {len(y)}", flush=True)
-
-    # Verify lengths match after delay compensation
-    if len(x) != len(y):
-        raise ValueError(f"Length mismatch after delay compensation: input={len(x)}, output={len(y)}")
-
-    # Convert knob settings to tensors that match the audio length
-    print("\nProcessing knob settings:", flush=True)
-    knob_tensors = {}
-    for name, value in knob_settings.items():
-        knob_tensors[name] = torch.full((len(x),), value, dtype=torch.float32)
-        print(f"  {name}: value={value}, tensor_length={len(x)}", flush=True)
-
-    print(f"\nCreating dataset with:", flush=True)
-    print(f"  nx (receptive field): {nx}", flush=True)
-    print(f"  ny (output samples): {ny if ny is not None else 'None (will be calculated)'}", flush=True)
-    
-    return MultiKnobDataset(x, y, knob_tensors, nx, ny, **kwargs)
+# Registration moved below MultiKnobDataset class definition
 
 
 class MultiKnobDataset(AbstractDataset):
@@ -149,7 +68,6 @@ class MultiKnobDataset(AbstractDataset):
         **kwargs  # Handle any other NAM parameters
     ):
         super().__init__()
-        print("\n=== MultiKnobDataset Initialization ===", flush=True)
         
         self._nx = nx
         self._ny = ny if ny is not None else len(x) - nx + 1
@@ -157,16 +75,6 @@ class MultiKnobDataset(AbstractDataset):
         self._x = x
         self._y = y
         self._knob_settings = knob_settings
-
-        print(f"Dataset parameters:", flush=True)
-        print(f"  Input length: {len(x)}", flush=True)
-        print(f"  Output length: {len(y)}", flush=True)
-        print(f"  Receptive field (nx): {nx}", flush=True)
-        print(f"  Output samples per datum (ny): {self._ny}", flush=True)
-        print(f"  Sample rate: {sample_rate}", flush=True)
-        print("\nKnob settings:", flush=True)
-        for name, values in knob_settings.items():
-            print(f"  {name}: length={len(values)}", flush=True)
 
         # Validate lengths
         if len(self._x) != len(self._y):
@@ -177,19 +85,16 @@ class MultiKnobDataset(AbstractDataset):
         n = len(self._x)
         single_pairs = n - self._nx + 1
         segments = single_pairs // self._ny
-        
-        print(f"\n=== Dataset Length Calculation ===", flush=True)
-        print(f"  Total samples (n): {n}", flush=True)
-        print(f"  Receptive field (nx): {self._nx}", flush=True)
-        print(f"  Samples per datum (ny): {self._ny}", flush=True)
-        print(f"  Single pairs (n - nx + 1): {single_pairs}", flush=True)
-        print(f"  Final segments (pairs // ny): {segments}", flush=True)
         return segments
 
-    def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        """Get input audio, output audio, and knob settings for a segment"""
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
+        """Get input audio, knob settings, and output audio for a segment
+        
+        Returns a tuple of (audio_segment, *knob_values, y_segment) where
+        knob_values are scalars for each knob in self._knob_names order.
+        This format allows proper batching by DataLoader.
+        """
         if idx >= len(self):
-            print(f"\nERROR: Index {idx} out of range for dataset of length {len(self)}", flush=True)
             raise IndexError(f"Index {idx} out of range for dataset of length {len(self)}")
             
         i = idx * self._ny
@@ -197,19 +102,10 @@ class MultiKnobDataset(AbstractDataset):
         x_segment = self._x[i:i + self._nx + self._ny - 1]
         y_segment = self._y[j:j + self._ny]
         
-        print(f"\n=== Getting Dataset Item {idx} ===", flush=True)
-        print(f"  Start index i: {i}", flush=True)
-        print(f"  End index j: {j}", flush=True)
-        print(f"  Input segment shape: {x_segment.shape}", flush=True)
-        print(f"  Output segment shape: {y_segment.shape}", flush=True)
+        # Get knob values - use same index for each knob in deterministic order
+        knob_values = tuple(self._knob_settings[name][i] for name in sorted(self._knob_settings.keys()))
         
-        # Get knob values - use same index for all knobs
-        knob_values = {name: values[i] for name, values in self._knob_settings.items()}
-        
-        # Combine audio and knob inputs
-        inputs = {"audio": x_segment, **knob_values}
-        
-        return inputs, y_segment
+        return (x_segment, *knob_values, y_segment)
 
     @property
     def sample_rate(self) -> Optional[float]:
@@ -366,8 +262,13 @@ class MultiKnobModel(BaseNet, ImportsWeights):
         # Store the receptive field for padding
         self._receptive_field = self.base_model.receptive_field
         
-    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        """Forward pass implementation required by base class"""
+    def forward(self, x: torch.Tensor, *knob_args, **kwargs) -> torch.Tensor:
+        """Forward pass implementation required by base class
+        
+        Args:
+            x: Input audio tensor
+            *knob_args: Knob values in sorted knob order
+        """
         # Extract pad_start from kwargs
         pad_start = kwargs.pop('pad_start', None)
         if pad_start is None:
@@ -393,7 +294,7 @@ class MultiKnobModel(BaseNet, ImportsWeights):
             raise ValueError(f"Input has {x.shape[-1]} samples, which is too few for this model with receptive field {self.receptive_field}!")
         
         # Process the input through our _forward
-        output = self._forward(x, *args, **kwargs)
+        output = self._forward(x, *knob_args, **kwargs)
         
         # Squeeze if input was scalar
         if x.ndim == 1:
@@ -401,13 +302,23 @@ class MultiKnobModel(BaseNet, ImportsWeights):
             
         return output
 
-    def _forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        """Internal forward pass implementation"""
-        # Process knob values
+    def _forward(self, x: torch.Tensor, *knob_args, **kwargs) -> torch.Tensor:
+        """Internal forward pass implementation
+        
+        Args:
+            x: Input audio tensor [batch, length] or [length]
+            *knob_args: Knob values in sorted knob order
+        """
+        # Process knob values - knob_args are in sorted order matching self._knob_names()
         embedded_knobs = []
-        for name in self.knob_order:
-            # Get knob value from kwargs or use default
-            value = kwargs.get(name, None)
+        knob_names = sorted(self.knob_config.keys())
+        
+        for idx, name in enumerate(knob_names):
+            if idx < len(knob_args):
+                value = knob_args[idx]
+            else:
+                value = None
+                
             if value is not None:
                 # Convert to tensor if needed
                 if not isinstance(value, torch.Tensor):
@@ -526,10 +437,4 @@ class MultiKnobModel(BaseNet, ImportsWeights):
 
 # Register extensions with NAM
 register_dataset_initializer("multi_knob", MultiKnobDataset.init_from_config)
-
-# The model will be registered when imported by NAM's extension system
-LightningModule.register_net_initializer(
-    "MultiKnob",
-    MultiKnobModel.init_from_config,
-    overwrite=True  # Allow overwriting existing registration
-) 
+register_model("MultiKnob", MultiKnobModel.init_from_config) 

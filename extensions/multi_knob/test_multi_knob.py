@@ -95,13 +95,18 @@ class TestMultiKnobDataset:
 
     def test_dataset_getitem(self, sample_dataset):
         """Test getting items from dataset"""
-        x_segment, knob_segment, y_segment = sample_dataset[0]
+        result = sample_dataset[0]
+        # Returns (audio, *knobs, y) - 2 knobs = 4 elements total
+        assert isinstance(result, tuple)
+        assert len(result) == 4  # audio + 2 knobs + y
+        
+        x_segment = result[0]
+        y_segment = result[-1]
+        
         assert isinstance(x_segment, torch.Tensor)
-        assert isinstance(knob_segment, dict)
         assert isinstance(y_segment, torch.Tensor)
         assert x_segment.shape[0] == 149  # nx + ny - 1
         assert y_segment.shape[0] == 50  # ny
-        assert all(k in knob_segment for k in ["gain", "tone"])
 
     def test_dataset_out_of_bounds(self, sample_dataset):
         """Test accessing out of bounds index"""
@@ -139,28 +144,23 @@ class TestMultiKnobModel:
         """Test model forward pass"""
         batch_size = 2
         input_length = sample_model.receptive_field + 100
-        x = torch.randn(batch_size, 1, input_length)  # Add channel dimension
-        # Knob values should be [batch_size, length]
-        gain = torch.full((batch_size, input_length), 5.0)
-        tone = torch.full((batch_size, input_length), 0.0)
-
-        # Test with explicit knob values
-        output = sample_model(x, gain=gain, tone=tone)
+        x = torch.randn(batch_size, input_length)
+        
+        # Knob values as positional args (sorted order: gain, tone)
+        gain_val = torch.tensor(5.0)
+        tone_val = torch.tensor(0.0)
+        
+        output = sample_model(x, gain_val, tone_val)
         assert isinstance(output, torch.Tensor)
         assert output.shape == (batch_size, input_length)
 
-        # Test with scalar knob values
-        output = sample_model(x, gain=5.0, tone=0.0)
-        assert isinstance(output, torch.Tensor)
-        assert output.shape == (batch_size, input_length)
-
-    def test_model_forward_default_knobs(self, sample_model):
-        """Test model forward pass with default knob values"""
+def test_model_forward_default_knobs(self, sample_model):
+        """Test model forward pass with default knob values (no knobs provided)"""
         batch_size = 2
         input_length = sample_model.receptive_field + 100
         x = torch.randn(batch_size, input_length)
-
-        output = sample_model(x)  # No knob values provided
+        
+        output = sample_model(x)
         assert isinstance(output, torch.Tensor)
         assert output.shape == (batch_size, input_length)
 
