@@ -3,6 +3,7 @@ Multi-knob extension for Neural Amp Modeler
 Enables training models with multiple knob parameters
 """
 
+import logging
 from typing import Dict, Optional, Sequence, Tuple, Any, Union
 import torch
 import torch.nn as nn
@@ -11,11 +12,17 @@ from nam.data import AbstractDataset, register_dataset_initializer, wav_to_tenso
 from nam.models.base import BaseNet
 from nam.models._abc import ImportsWeights
 from nam.models.factory import register as register_model
-from nam.models.metadata import UserMetadata
-from nam.models.wavenet import WaveNet
+from nam.models.metadata import UserMetadata as _UserMetadata
+from nam.models.wavenet._wavenet import WaveNet as _WaveNet
 from pydantic import BaseModel
 
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
 # Metadata Extensions
+# =============================================================================
+
 class KnobMetadata(BaseModel):
     """Metadata for a single knob parameter"""
     name: str
@@ -25,157 +32,175 @@ class KnobMetadata(BaseModel):
     units: Optional[str] = None
 
 
-class MultiKnobUserMetadata(UserMetadata):
+class MultiKnobUserMetadata(_UserMetadata):
     """Extended metadata to include knob information"""
-    knobs: Dict[str, KnobMetadata]
+    knobs: Dict[str, KnobMetadata] = {}
 
 
-# Registration moved below MultiKnobDataset class definition
+# =============================================================================
+# Knob Conditioning WaveNet (acts as condition_dsp)
+# =============================================================================
 
+class KnobConditioningWaveNet(_WaveNet):
+    """
+    A WaveNet subclass that produces conditioning from knob values
+    instead of processing audio through its layers.
+
+    Used as the condition_dsp parameter in WaveNet to provide FiLM conditioning
+    based on external knob parameters.
+    """
+
+    def __init__(self, knob_names: list, embedding_dim: int):
+        # Initialize as a minimal WaveNet with no layers - we only use it for
+        # the conditioning interface
+        nn.Module.__init__(self)
+        self._knob_names = knob_names
+        self._condition_size = len(knob_names) * embedding_dim
+        self._stored_values = None
+
+        # Create embedding layers for each knob
+        self.knob_embeddings = nn.ModuleDict()
+        for name in knob_names:
+            self.knob_embeddings[name] = nn.Linear(1, embedding_dim, bias=True)
+
+    def set_values(self, *knob_values: torch.Tensor):
+        """Store knob values to use during forward pass."""
+        self._stored_values = knob_values
+
+    @property
+    def receptive_field(self) -> int:
+        """Return 1 to not increase the main model's receptive field."""
+        return 1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Produces conditioning signal from stored knob values.
+
+        Args:
+            x: Input audio tensor (B, C, L) - used only for shape reference
+
+        Returns:
+            Conditioning tensor (B, condition_size, L)
+        """
+        if self._stored_values is None:
+            raise RuntimeError("Knob values not set. Call set_values() before forward.")
+
+        batch_size = x.shape[0]
+        seq_len = x.shape[-1]
+        device = x.device
+        embedded = []
+
+        for idx, name in enumerate(self._knob_names):
+            value = self._stored_values[idx]
+            if not isinstance(value, torch.Tensor):
+                value = torch.tensor(value, dtype=torch.float32, device=device)
+            if value.ndim == 0:
+                value = value.expand(batch_size, seq_len)
+            elif value.ndim == 1:
+                value = value.unsqueeze(0).expand(batch_size, -1)
+            elif value.ndim == 2 and value.shape[-1] != seq_len:
+                value = value.expand(batch_size, seq_len)
+
+            v = value.unsqueeze(1).to(device)  # (B, 1, L)
+            e = self.knob_embeddings[name](v.transpose(1, 2)).transpose(1, 2)
+            embedded.append(e)
+
+        return torch.cat(embedded, dim=1)
+
+
+# =============================================================================
+# Dataset
+# =============================================================================
 
 class MultiKnobDataset(AbstractDataset):
-    """Dataset that handles both audio and knob parameter data.
+    """Dataset that pairs audio with per-sample knob parameter values."""
 
-    This dataset implementation supports delay compensation between input and output audio.
-    The delay parameter specifies the number of samples difference between input and output.
-    
-    Delay Implementation:
-    - If delay > 0: Input is longer than output by 'delay' samples
-      We trim 'delay' samples from the start of input and end of output
-    - If delay < 0: Output is longer than input by 'delay' samples
-      We trim '-delay' samples from the end of input and start of output
-      
-    Note: This implementation uses manual delay values rather than automatic detection.
-    The delay values should be determined beforehand (e.g., using analyze_wav.py) and 
-    specified in the dataset configuration file.
-    
-    Example delay calculation:
-    If input.wav is 210,477 samples and output.wav is 208,943 samples:
-    delay = 210,477 - 208,943 = 1,534 samples
-    This means the input is 1,534 samples longer, so we trim:
-    - 1,534 samples from the start of input
-    - 1,534 samples from the end of output
-    """
-    
     def __init__(
         self,
-        x: torch.Tensor,  # Input audio
-        y: torch.Tensor,  # Output audio
-        knob_settings: Dict[str, torch.Tensor],  # Knob values per sample
-        nx: int,  # Receptive field
-        ny: Optional[int] = None,  # Output samples per datum
+        x: torch.Tensor,
+        y: torch.Tensor,
+        knob_settings: Dict[str, torch.Tensor],
+        nx: int,
+        ny: Optional[int] = None,
         sample_rate: Optional[float] = None,
-        **kwargs  # Handle any other NAM parameters
+        **kwargs,
     ):
         super().__init__()
-        
         self._nx = nx
         self._ny = ny if ny is not None else len(x) - nx + 1
         self._sample_rate = sample_rate
         self._x = x
         self._y = y
         self._knob_settings = knob_settings
+        self._knob_names = sorted(knob_settings.keys())
 
-        # Validate lengths
         if len(self._x) != len(self._y):
             raise ValueError(f"Length mismatch: input={len(self._x)}, output={len(self._y)}")
 
     def __len__(self) -> int:
-        """Calculate number of segments in dataset"""
         n = len(self._x)
         single_pairs = n - self._nx + 1
-        segments = single_pairs // self._ny
-        return segments
+        return max(single_pairs // self._ny, 0)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
-        """Get input audio, knob settings, and output audio for a segment
-        
-        Returns a tuple of (audio_segment, *knob_values, y_segment) where
-        knob_values are scalars for each knob in self._knob_names order.
-        This format allows proper batching by DataLoader.
+    def __getitem__(self, idx: int):
+        """
+        Returns (audio_segment, *knob_values, y_segment).
+        Flat tuple format allows proper batching by DataLoader.
         """
         if idx >= len(self):
             raise IndexError(f"Index {idx} out of range for dataset of length {len(self)}")
-            
+
         i = idx * self._ny
         j = i + self._nx - 1
-        x_segment = self._x[i:i + self._nx + self._ny - 1]
-        y_segment = self._y[j:j + self._ny]
-        
-        # Get knob values - use same index for each knob in deterministic order
-        knob_values = tuple(self._knob_settings[name][i] for name in sorted(self._knob_settings.keys()))
-        
+        x_segment = self._x[i : i + self._nx + self._ny - 1]
+        y_segment = self._y[j : j + self._ny]
+        knob_values = tuple(self._knob_settings[name][i] for name in self._knob_names)
+
         return (x_segment, *knob_values, y_segment)
 
     @property
     def sample_rate(self) -> Optional[float]:
-        """Get the sample rate of the audio data"""
         return self._sample_rate
 
     @property
     def nx(self) -> int:
-        """Get the receptive field size"""
         return self._nx
 
     @property
     def ny(self) -> int:
-        """Get the output length"""
         return self._ny
 
     @property
     def x(self) -> torch.Tensor:
-        """Get the input audio data"""
         return self._x
 
     @property
     def y(self) -> torch.Tensor:
-        """Get the output audio data"""
         return self._y
-
-    @property
-    def knob_settings(self) -> Dict[str, torch.Tensor]:
-        """Get the knob settings"""
-        return self._knob_settings
 
     @classmethod
     def init_from_config(cls, config):
-        """Initialize dataset from configuration dictionary"""
-        parsed_config = cls.parse_config(config)
-        return cls(**parsed_config)
+        parsed = cls.parse_config(config)
+        return cls(**parsed)
 
     @classmethod
     def parse_config(cls, config):
-        """Parse configuration and convert file paths to tensors"""
         from nam.data import wav_to_tensor
-        
-        # Get sample rate from config
+
         sample_rate = config.pop("sample_rate", None)
-        
-        # Load audio files
         x = wav_to_tensor(config.pop("x_path"), rate=sample_rate)
         y = wav_to_tensor(config.pop("y_path"), rate=sample_rate)
-        
-        # Convert knob settings to tensors
+
         raw_knob_settings = config.pop("knob_settings", {})
         knob_settings = {}
-        for knob_name, value in raw_knob_settings.items():
+        for name, value in raw_knob_settings.items():
             if value is not None:
-                # Create a tensor of the same length as x filled with the knob value
-                knob_settings[knob_name] = torch.full((len(x),), value, dtype=torch.float32)
-        
-        # Get other parameters
+                knob_settings[name] = torch.full((len(x),), value, dtype=torch.float32)
+
         nx = config.pop("nx", None)
         if nx is None:
-            # If nx not provided, try to get it from the model's receptive field
-            from nam.train.lightning_module import _model_net_init_registry
-            model_config = config.get("model_config", {})
-            if model_config:
-                model = _model_net_init_registry[model_config["name"]](model_config["config"])
-                nx = model.receptive_field
-            else:
-                nx = 8192  # Default value
-        
-        # Return all parameters including common NAM parameters
+            nx = 8192
+
         return {
             "x": x,
             "y": y,
@@ -183,258 +208,150 @@ class MultiKnobDataset(AbstractDataset):
             "nx": nx,
             "ny": config.pop("ny", None),
             "sample_rate": sample_rate,
-            **config  # Pass through any remaining parameters
+            **config,
         }
 
 
-# Model Implementation
+# =============================================================================
+# Model
+# =============================================================================
+
 class MultiKnobModel(BaseNet, ImportsWeights):
-    """Neural network model that supports multiple conditioning knobs"""
-    
+    """
+    WaveNet-based model conditioned on external knob parameters.
+    Uses WaveNet's built-in FiLM conditioning via condition_dsp mechanism.
+    """
+
     def __init__(
         self,
         knob_config: Dict[str, Dict[str, Any]],
         base_model: Union[str, BaseNet] = "WaveNet",
         sample_rate: Optional[float] = None,
-        **kwargs
+        **kwargs,
     ):
-        """Initialize the multi-knob model
-        
-        Args:
-            knob_config: Dictionary mapping knob names to their configurations
-                Each knob config should have:
-                - embedding_dim: int, dimension of the embedding
-                - default_value: float, value to use when knob is not provided
-            base_model: Either a string naming the base model type (e.g. "WaveNet")
-                       or an instance of a BaseNet model
-            sample_rate: Optional sample rate for the model
-        """
         super().__init__(sample_rate=sample_rate)
         self.knob_config = knob_config
-        
-        # Define knob order (fixed order for consistency)
-        self.knob_order = sorted(knob_config.keys())  # Use sorted keys for deterministic order
-        
-        # Create embedding layers for each knob
-        self.knob_embeddings = nn.ModuleDict()
-        for name, config in knob_config.items():
-            self.knob_embeddings[name] = nn.Linear(
-                in_features=1,  # Single knob value
-                out_features=config['embedding_dim'],  # Embed into higher dimension
-                bias=True
-            )
-            
-        # Calculate total embedding dimension for conditioning
-        total_embedding_dim = sum(config['embedding_dim'] for config in knob_config.values())
-        
-        # Initialize base model
-        if isinstance(base_model, str):
-            if base_model == "WaveNet":
-                channels = 32  # Match WaveNet's internal channel count
-                head_size = channels // 2  # Half channels for head
-                self.base_model = WaveNet(
-                    layers_configs=[{
-                        "input_size": 1,  # Single input channel
-                        "condition_size": total_embedding_dim,  # Total embedding dimension
-                        "channels": channels,
-                        "head_size": head_size,  # Half channels for head
-                        "kernel_size": 3,
-                        "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
-                        "activation": "Tanh",
-                        "gated": True,  # Enable gated activations
-                        "head_bias": True,  # Enable head bias
-                    }],
-                    head_config={
-                        "in_channels": head_size,  # Match head_size from layers
-                        "channels": head_size,  # Same size for internal layers
-                        "activation": "Tanh",  # Match layer activation
-                        "num_layers": 2,  # Two layers for sufficient capacity
-                        "out_channels": 1,  # Single output channel
-                    },
-                    head_scale=0.02,  # Scale factor for the output
-                    sample_rate=sample_rate
-                )
-            else:
-                raise ValueError(f"Unknown base model: {base_model}")
+        self._knob_names = sorted(knob_config.keys())
+        total_embedding_dim = sum(c["embedding_dim"] for c in knob_config.values())
+
+        if isinstance(base_model, str) and base_model == "WaveNet":
+            channels = 32
+            head_size = channels // 2
+
+            # Build internal WaveNet with knob conditioning DSP
+            self._wavenet = _WaveNet.init_from_config({
+                "layers_configs": [{
+                    "input_size": 1,
+                    "condition_size": total_embedding_dim,
+                    "channels": channels,
+                    "head_size": head_size,
+                    "kernel_size": 3,
+                    "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+                    "activation": "Tanh",
+                    "gated": True,
+                    "head_bias": True,
+                }],
+                "head_config": {
+                    "in_channels": head_size,
+                    "channels": head_size,
+                    "activation": "Tanh",
+                    "num_layers": 2,
+                    "out_channels": 1,
+                },
+                "head_scale": 0.02,
+                "condition_dsp": KnobConditioningWaveNet(self._knob_names, 8),
+            })
+        elif isinstance(base_model, BaseNet):
+            self._wavenet = base_model._net if hasattr(base_model, '_net') else base_model
         else:
-            self.base_model = base_model
-            
-        # Store the receptive field for padding
-        self._receptive_field = self.base_model.receptive_field
-        
+            raise ValueError(f"Unknown base model: {base_model}")
+
+        self._receptive_field = self._wavenet.receptive_field
+
     def forward(self, x: torch.Tensor, *knob_args, **kwargs) -> torch.Tensor:
-        """Forward pass implementation required by base class
-        
-        Args:
-            x: Input audio tensor
-            *knob_args: Knob values in sorted knob order
-        """
-        # Extract pad_start from kwargs
-        pad_start = kwargs.pop('pad_start', None)
+        pad_start = kwargs.pop("pad_start", None)
         if pad_start is None:
             pad_start = self.pad_start_default
-        
-        # Add padding if needed
+
         if pad_start:
-            # Add padding for WaveNet's receptive field
             pad_length = self.receptive_field - 1
-            # Ensure x has channel dimension
             if x.ndim == 2:
                 x = x.unsqueeze(1)
             elif x.ndim == 1:
                 x = x.unsqueeze(0).unsqueeze(0)
-            # Add padding with correct dimensions
             x = torch.cat(
-                (torch.zeros((len(x), x.shape[1], pad_length)).to(x.device), x),
+                (torch.zeros(x.shape[0], x.shape[1], pad_length, device=x.device), x),
                 dim=2,
             )
-        
-        # Check if we have enough samples
+
         if x.shape[-1] < self.receptive_field:
-            raise ValueError(f"Input has {x.shape[-1]} samples, which is too few for this model with receptive field {self.receptive_field}!")
-        
-        # Process the input through our _forward
+            raise ValueError(
+                f"Input has {x.shape[-1]} samples, need {self.receptive_field}"
+            )
+
         output = self._forward(x, *knob_args, **kwargs)
-        
-        # Squeeze if input was scalar
+
         if x.ndim == 1:
             output = output[0]
-            
         return output
 
     def _forward(self, x: torch.Tensor, *knob_args, **kwargs) -> torch.Tensor:
-        """Internal forward pass implementation
-        
-        Args:
-            x: Input audio tensor [batch, length] or [length]
-            *knob_args: Knob values in sorted knob order
-        """
-        # Process knob values - knob_args are in sorted order matching self._knob_names()
-        embedded_knobs = []
-        knob_names = sorted(self.knob_config.keys())
-        
-        for idx, name in enumerate(knob_names):
-            if idx < len(knob_args):
-                value = knob_args[idx]
-            else:
-                value = None
-                
-            if value is not None:
-                # Convert to tensor if needed
-                if not isinstance(value, torch.Tensor):
-                    value = torch.tensor(value).to(x.device)
-                # Expand scalar value to match input dimensions
-                if value.ndim == 0:
-                    value = value.expand(x.shape[0], x.shape[-1])
-                # Ensure value has batch dimension
-                elif value.ndim == 1:
-                    value = value.unsqueeze(0)
-            else:
-                # Use default value
-                default_value = self.knob_config[name]['default_value']
-                value = torch.full((x.shape[0], x.shape[-1]), default_value).to(x.device)
-            
-            # Add channel dimension for embedding
-            value = value.unsqueeze(1)  # [B, 1, L]
-            # Embed the knob value
-            embedded = self.knob_embeddings[name](value.transpose(1, 2))  # [B, L, E]
-            embedded = embedded.transpose(1, 2)  # [B, E, L]
-            # Ensure embedded has the same length as input by interpolating
-            if embedded.shape[-1] != x.shape[-1]:
-                embedded = torch.nn.functional.interpolate(
-                    embedded,
-                    size=x.shape[-1],
-                    mode='nearest'
-                )
-            embedded_knobs.append(embedded)
-        
-        # Combine all knob embeddings
-        combined_conditioning = torch.cat(embedded_knobs, dim=1)  # [B, total_E, L]
-        
-        # Ensure x has channel dimension
-        if x.ndim == 2:
-            x = x.unsqueeze(1)
-        
-        # Pass through base model's internal layers
-        if isinstance(self.base_model, WaveNet):
-            # Get the WaveNet's internal layers
-            wavenet = self.base_model._net
-            # Process through each layer group with conditioning
-            x_out = x
-            head_input = None
-            for layer_group in wavenet._layers:
-                head_input, x_out = layer_group(x_out, combined_conditioning, head_input=head_input)
-            
-            # Apply head scale
-            head_input = wavenet._head_scale * head_input
-            
-            # Apply head if it exists, otherwise use head input
-            x_out = wavenet._head(head_input) if wavenet._head is not None else head_input
-            
-            # Ensure output has correct shape [batch_size, num_samples]
-            assert x_out.shape[1] == 1, f"Expected output to have 1 channel, got {x_out.shape[1]}"
-            x_out = x_out[:, 0, :]  # Remove channel dimension
-            
-            return x_out
-        else:
-            raise NotImplementedError("Only WaveNet base model is currently supported")
+        """Set knob values on conditioning DSP, then run WaveNet."""
+        x_input = x.unsqueeze(1) if x.ndim == 2 else x
+
+        if x_input.ndim == 1:
+            x_input = x_input.unsqueeze(0).unsqueeze(0)
+
+        # Set knob values on the conditioning DSP
+        condition_dsp = self._wavenet._condition_dsp
+        condition_dsp.set_values(*knob_args)
+
+        y = self._wavenet(x_input)
+        assert y.shape[1] == 1, f"Expected 1 output channel, got {y.shape[1]}"
+        return y[:, 0, :]
 
     def import_weights(self, weights: Sequence[float]):
-        """Import weights for knob embeddings and base model"""
-        offset = 0
-        
-        # Import knob embedding weights
-        for name, embedding in self.knob_embeddings.items():
-            num_params = embedding.weight.numel() + embedding.bias.numel()
-            layer_weights = torch.tensor(weights[offset:offset + num_params])
-            
-            # Split into weight and bias
-            weight_size = embedding.weight.numel()
-            embedding.weight.data = layer_weights[:weight_size].reshape(embedding.weight.shape)
-            embedding.bias.data = layer_weights[weight_size:].reshape(embedding.bias.shape)
-            offset += num_params
-            
-        # Import base model weights
-        self.base_model.import_weights(weights[offset:])
+        raise NotImplementedError("MultiKnobModel weight import not implemented")
 
     @property
     def pad_start_default(self) -> bool:
-        """Default value for pad_start parameter"""
-        return self.base_model.pad_start_default
-        
+        return True
+
     @property
     def receptive_field(self) -> int:
-        """Receptive field of the model"""
         return self._receptive_field
 
     def _export_config(self):
-        """Export model configuration"""
+        """Export config with knob metadata."""
+        wavenet_config = self._wavenet.export_config(sample_rate=self.sample_rate)
         return {
             "knob_config": self.knob_config,
-            "base_model": self.base_model.__class__.__name__,
-            "sample_rate": self.sample_rate
+            "knob_names": self._knob_names,
+            **wavenet_config,
         }
 
     def _export_weights(self) -> np.ndarray:
-        """Export weights for knob embeddings and base model"""
-        weights = []
-        
-        # Export knob embedding weights
-        for embedding in self.knob_embeddings.values():
-            weights.extend(embedding.weight.data.cpu().numpy().flatten())
-            weights.extend(embedding.bias.data.cpu().numpy().flatten())
-        
-        # Export base model weights
-        weights.extend(self.base_model._export_weights())
-        
+        """
+        Export weights from main WaveNet + conditioning DSP.
+        """
+        weights = list(self._wavenet.export_weights())
+        # Append conditioning DSP knob embedding weights
+        condition_dsp = self._wavenet._condition_dsp
+        for name in self._knob_names:
+            emb = condition_dsp.knob_embeddings[name]
+            weights.extend(emb.weight.data.cpu().numpy().flatten())
+            if emb.bias is not None:
+                weights.extend(emb.bias.data.cpu().numpy().flatten())
         return np.array(weights)
 
     @classmethod
     def init_from_config(cls, config):
-        """Initialize model from configuration dictionary"""
         return cls(**config)
 
 
-# Register extensions with NAM
+# =============================================================================
+# Registration
+# =============================================================================
+
 register_dataset_initializer("multi_knob", MultiKnobDataset.init_from_config)
-register_model("MultiKnob", MultiKnobModel.init_from_config) 
+register_model("MultiKnob", MultiKnobModel.init_from_config)

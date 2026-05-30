@@ -149,6 +149,7 @@ trained_models/
 # Mac OS
 .DS_Store
 extensions/.DS_Store
+extensions/**/.DS_Store
 
 *.html
 *.png
