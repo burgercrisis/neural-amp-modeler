@@ -20,12 +20,13 @@ dependencies = [
     "scipy",  # Required by auraloss
     "sounddevice",
     "tensorboard",
-    "torch",
+    "torch==2.2.2",
     # `transformers` is not required, but if you have it, it needs to be recent
     # enough so I'm adding it.
     "transformers>=4",
     "tqdm",
     "wavio>=0.0.5",
+    "plotly",
 ]
 dynamic = ["version"]
 

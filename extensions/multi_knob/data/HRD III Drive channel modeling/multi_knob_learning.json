@@ -1,0 +1,21 @@
+{
+    "train_dataloader": {
+        "batch_size": 16,
+        "shuffle": true,
+        "pin_memory": true,
+        "drop_last": true,
+        "num_workers": 0
+    },
+    "val_dataloader": {},
+    "trainer": {
+        "accelerator": "cpu",
+        "devices": 1,
+        "max_epochs": 30,
+        "enable_progress_bar": true,
+        "enable_model_summary": true,
+        "enable_checkpointing": true,
+        "log_every_n_steps": 1,
+        "logger": false
+    },
+    "trainer_fit_kwargs": {}
+}

@@ -139,3 +139,16 @@ nam/train/gui/_resources/settings.json
 
 # Resources downloaded into tests/
 tests/resources/*.reapeaks
+
+# Extensions
+extensions/__pycache__/
+
+# Trained models
+trained_models/
+
+# Mac OS
+.DS_Store
+extensions/.DS_Store
+
+*.html
+*.png
