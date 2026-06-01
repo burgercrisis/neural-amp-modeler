@@ -262,6 +262,7 @@ class MultiKnobModel(BaseNet, ImportsWeights):
                 "input_size": 1,
                 "condition_size": total_embedding_dim,
                 "channels": channels,
+                "head": {"out_channels": head_size, "kernel_size": 1, "bias": True},
                 "head_size": head_size,
                 "kernel_size": 3,
                 "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
@@ -279,8 +280,8 @@ class MultiKnobModel(BaseNet, ImportsWeights):
                 in_channels=head_size,
                 channels=head_size,
                 activation="Tanh",
-                num_layers=2,
                 out_channels=1,
+                kernel_sizes=[1, 1],
             )
 
             self._wavenet = _WaveNet(
@@ -350,27 +351,46 @@ class MultiKnobModel(BaseNet, ImportsWeights):
         return self._receptive_field
 
     def _export_config(self):
-        """Export config with knob metadata."""
-        wavenet_config = self._wavenet.export_config(sample_rate=self.sample_rate)
-        return {
-            "knob_config": self.knob_config,
-            "knob_names": self._knob_names,
-            **wavenet_config,
+        """Export config with knob metadata and KnobConditioning condition_dsp."""
+        # Build the base WaveNet config (layers, head, head_scale) without
+        # delegating to WaveNet.export_config(), which would fail because
+        # KnobConditioningWaveNet is not an instance of WaveNet.
+        wavenet = self._wavenet
+        config = {
+            "layers": [la.export_config() for la in wavenet._layer_arrays],
+            "head": None if wavenet._head is None else wavenet._head.export_config(),
+            "head_scale": wavenet._head_scale,
         }
+
+        # Export condition_dsp as KnobArchitecture (not WaveNet) with its own weights
+        condition_dsp = wavenet._condition_dsp
+        config["condition_dsp"] = {
+            "version": "0.7.0",
+            "architecture": "KnobConditioning",
+            "config": condition_dsp._export_config(),
+            "weights": condition_dsp._export_weights(),
+        }
+        if self.sample_rate is not None:
+            config["condition_dsp"]["sample_rate"] = self.sample_rate
+
+        # Knob metadata for plugin UI
+        config["knob_metadata"] = {
+            name: {
+                "min_value": self.knob_config[name].get("min_value", 0.0),
+                "max_value": self.knob_config[name].get("max_value", 1.0),
+                "default_value": self.knob_config[name].get("default_value", 0.5),
+            }
+            for name in self._knob_names
+        }
+
+        return config
 
     def _export_weights(self) -> np.ndarray:
         """
-        Export weights from main WaveNet + conditioning DSP.
+        Export weights from main WaveNet only.
+        Condition_dsp weights are exported separately in the nested condition_dsp JSON.
         """
-        weights = list(self._wavenet.export_weights())
-        # Append conditioning DSP knob embedding weights
-        condition_dsp = self._wavenet._condition_dsp
-        for name in self._knob_names:
-            emb = condition_dsp.knob_embeddings[name]
-            weights.extend(emb.weight.data.cpu().numpy().flatten())
-            if emb.bias is not None:
-                weights.extend(emb.bias.data.cpu().numpy().flatten())
-        return np.array(weights)
+        return self._wavenet.export_weights()
 
     @classmethod
     def init_from_config(cls, config):

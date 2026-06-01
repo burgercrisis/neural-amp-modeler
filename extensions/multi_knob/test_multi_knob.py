@@ -221,19 +221,80 @@ class TestMultiKnobModel:
 
     def test_export_config(self, sample_model):
         config = sample_model._export_config()
-        assert "knob_config" in config
-        assert "knob_names" in config
         assert "layers" in config
+        assert "head" in config
+        assert "head_scale" in config
+        assert "condition_dsp" in config
+        assert "knob_metadata" in config
+
+        # Verify condition_dsp structure
+        cdsp = config["condition_dsp"]
+        assert cdsp["architecture"] == "KnobConditioning"
+        assert "knob_names" in cdsp["config"]
+        assert "embedding_dim" in cdsp["config"]
+        assert isinstance(cdsp["weights"], list)
+        assert len(cdsp["weights"]) == len(sample_model._knob_names) * 8 * 2  # K * emb * 2
+
+        # Verify knob_metadata structure
+        meta = config["knob_metadata"]
+        assert len(meta) == len(sample_model._knob_names)
+        for name in sample_model._knob_names:
+            assert name in meta
+            assert "min_value" in meta[name]
+            assert "max_value" in meta[name]
+            assert "default_value" in meta[name]
 
     def test_export_weights(self, sample_model):
         weights = sample_model._export_weights()
         assert isinstance(weights, np.ndarray)
         assert weights.ndim == 1
+        # Weights should be ONLY the main WaveNet weights (no condition_dsp appended)
+        # Previously this included condition_dsp weights; now they're separate
+        expected_wavenet_weights = len(sample_model._wavenet.export_weights())
+        assert len(weights) == expected_wavenet_weights
 
     def test_insufficient_samples_error(self, sample_model):
-        x = torch.randn(2, 10)  # Too few samples
+        # pad_start=False to bypass the automatic padding that forward() applies
+        x = torch.randn(2, max(sample_model.receptive_field - 1, 1))
         with pytest.raises(ValueError):
-            sample_model(x, 5.0, 0.0)
+            sample_model(x, 5.0, 0.0, pad_start=False)
+
+    def test_export_condition_dsp_weight_count(self, sample_model):
+        """Verify condition_dsp weight count matches C++ expectation: K * emb_dim * 2."""
+        config = sample_model._export_config()
+        cdsp = config["condition_dsp"]
+        K = len(sample_model._knob_names)
+        emb_dim = cdsp["config"]["embedding_dim"]
+        expected = K * emb_dim * 2
+        assert len(cdsp["weights"]) == expected, (
+            f"Expected {expected} condition_dsp weights, got {len(cdsp['weights'])}"
+        )
+
+    def test_export_condition_dsp_knob_names_match(self, sample_model):
+        """Verify condition_dsp knob_names match the model's knob names."""
+        config = sample_model._export_config()
+        cdsp = config["condition_dsp"]
+        assert cdsp["config"]["knob_names"] == sample_model._knob_names
+
+    def test_export_knob_metadata_keys(self, sample_model):
+        """Verify knob_metadata uses knob names (not config keys) as dict keys."""
+        config = sample_model._export_config()
+        meta = config["knob_metadata"]
+        for name in sample_model._knob_names:
+            assert name in meta, f"Knob '{name}' missing from knob_metadata"
+
+    def test_export_weights_separate_from_condition_dsp(self):
+        """Verify main weights and condition_dsp weights are not mixed."""
+        knob_config = {
+            "gain": {"embedding_dim": 8, "min_value": 0.0, "max_value": 1.0, "default_value": 0.5},
+            "tone": {"embedding_dim": 8, "min_value": 0.0, "max_value": 1.0, "default_value": 0.5},
+        }
+        model = MultiKnobModel(knob_config=knob_config, base_model="WaveNet", sample_rate=48000)
+
+        main_weights = model._export_weights()
+        wavenet_only = model._wavenet.export_weights()
+        # Main export should match WaveNet-only export (no condition_dsp weights)
+        np.testing.assert_array_equal(main_weights, wavenet_only)
 
 
 # =============================================================================
