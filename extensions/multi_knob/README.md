@@ -144,3 +144,16 @@ pytest extensions/multi_knob/test_multi_knob.py -v
 - NAM version 0.7.x or later
 - PyTorch 2.x
 - Python 3.10+
+
+## Plugin Compatibility
+
+**Important**: Multi-knob models export as `.nam` files with a `"MultiKnob"` architecture. The standard NAM plugin (NeuralAmpModelerPlugin) does **not** support this architecture - it only supports `WaveNet`, `ConvNet`, `LSTM`, and `Linear`.
+
+To use multi-knob models for real-time playback with knob control, you need a custom plugin that:
+1. Registers a `"MultiKnob"` architecture in the `ConfigParserRegistry`
+2. Passes external knob values to the model at inference time
+3. Exposes knob controls in the UI
+
+The standard plugin's C++ WaveNet already has `condition_dsp` support, but it expects a nested WaveNet with layers/dilations - not a simple knob embedding module. Adding true multi-knob inference requires C++ changes to NeuralAmpModelerCore.
+
+Alternatively, you can train a multi-knob model and re-export it as a standard WaveNet architecture (losing knob control but gaining plugin compatibility).
